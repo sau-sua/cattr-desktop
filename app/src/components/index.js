@@ -13,5 +13,6 @@ module.exports = () => {
   require('./os-inactivity-handler.js');
   require('./usage-statistic');
   require('./log-rotate');
+  require('./tracking-notifier');
 
 };

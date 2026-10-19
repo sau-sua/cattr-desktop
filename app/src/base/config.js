@@ -122,13 +122,13 @@ configuration.updateNotification = {
    * URL of the latest published GitHub release
    * @type {String}
    */
-  latestReleaseUrl: 'https://api.github.com/repos/cattr-app/desktop-application/releases/latest',
+  latestReleaseUrl: 'https://api.github.com/repos/sau-sua/cattr-desktop/releases/latest',
 
   /**
    * URL to downloads page
    * @type {String}
    */
-  downloadsPageUrl: 'https://cattr.app/desktop',
+  downloadsPageUrl: 'https://github.com/sau-sua/cattr-desktop/releases',
 
 };
 

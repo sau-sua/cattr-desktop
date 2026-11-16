@@ -316,9 +316,15 @@ jobs:
           echo "macOS signing: $signing"
           echo "macOS notarization: $notarization"
 
+      # `shell` cannot read the matrix, hence one step per shell.
       - name: Package application
-        if: matrix.platform != 'mac'
-        shell: ${{ matrix.package-shell }}
+        if: matrix.platform != 'mac' && matrix.package-shell == 'bash'
+        shell: bash
+        run: ${{ matrix.package-command }}
+
+      - name: Package application (PowerShell)
+        if: matrix.platform != 'mac' && matrix.package-shell == 'pwsh'
+        shell: pwsh
         run: ${{ matrix.package-command }}
 
       - name: Package unsigned macOS application

@@ -1,9 +1,26 @@
 name: Build release artifacts
 
+# Three ways to start a release:
+#   - a commit lands on main: the next release tag is worked out and created
+#     automatically (see .github/scripts/next-release-tag.sh);
+#   - a manual run from the Actions tab: same as above, or a build-only run
+#     when "publish" is unticked;
+#   - a tag pushed by hand: that tag is released as is.
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: >-
+          Create the next release tag and publish a release. Untick to only
+          build: nothing is tagged or released, and the packages are attached
+          to the workflow run instead.
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -11,16 +28,93 @@ permissions:
   attestations: write
   artifact-metadata: write
 
+# One release at a time. Two runs working out the next tag in parallel would
+# pick the same number.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      ref: ${{ steps.release.outputs.ref }}
+      publish: ${{ steps.release.outputs.publish }}
+      skip: ${{ steps.release.outputs.skip }}
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          # The next tag is derived from the existing ones; a full fetch
+          # brings every tag along.
+          fetch-depth: 0
+
+      - name: Work out the release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          skip=false
+
+          if [[ "$GITHUB_REF_TYPE" == 'tag' ]]; then
+            # A tag pushed by hand is released under its own name.
+            tag="$GITHUB_REF_NAME"
+            ref="refs/tags/$tag"
+          else
+            next="$(bash .github/scripts/next-release-tag.sh "$GITHUB_SHA")"
+            tag="$(sed -n 's/^tag=//p' <<< "$next")"
+            existing="$(sed -n 's/^existing=//p' <<< "$next")"
+            ref="$GITHUB_SHA"
+
+            if [[ "$PUBLISH" == 'true' ]]; then
+              ref="refs/tags/$tag"
+
+              if [[ "$existing" == 'true' ]]; then
+                # This commit was tagged by an earlier run. Finish that release
+                # if it is still a draft; if it is already out there is nothing
+                # left to do.
+                if [[ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)" == 'false' ]]; then
+                  echo "::notice::$GITHUB_SHA is already released as $tag."
+                  skip=true
+                fi
+              else
+                # Tags created with the workflow token do not start another
+                # run, so this does not trigger the tag push event above.
+                gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+                  -f "ref=refs/tags/$tag" \
+                  -f "sha=$GITHUB_SHA" > /dev/null
+                echo "Created tag $tag at $GITHUB_SHA."
+              fi
+            fi
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "ref=$ref"
+            echo "publish=$PUBLISH"
+            echo "skip=$skip"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Release tag: $tag (publish: $PUBLISH, skip: $skip)"
+
   create-draft-release:
     name: Create draft release
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-latest
 
     steps:
       - name: Create or resume draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         shell: bash
         run: |
           if is_draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null); then
@@ -30,12 +124,21 @@ jobs:
             fi
             echo "Draft release $RELEASE_TAG already exists; resuming asset upload."
           else
-            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft --generate-notes
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft --generate-notes --verify-tag
           fi
 
   build-and-attest:
     name: ${{ matrix.name }}
-    needs: create-draft-release
+    needs:
+      - prepare
+      - create-draft-release
+    # A build-only run has no draft release, so that job is skipped; build
+    # anyway unless it failed or this commit is already released.
+    if: >-
+      !cancelled()
+      && needs.prepare.result == 'success'
+      && needs.prepare.outputs.skip != 'true'
+      && (needs.create-draft-release.result == 'success' || needs.create-draft-release.result == 'skipped')
     runs-on: ${{ matrix.os }}
     # electron-builder launches a separate `npm rebuild` while packaging.
     # These settings must therefore apply to every step, not only `npm ci`.
@@ -45,33 +148,87 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The x64 entries package exactly as before and keep their file names
+        # (Cattr.dmg, Cattr.exe, ...), so existing download links stay valid.
+        # The ARM entries add "-arm64" to every file name; they pass the name
+        # on the command line instead of changing electron-builder.json so the
+        # x64 packages are not affected.
         include:
           - name: Linux
+            platform: linux
+            arch: x64
             os: ubuntu-latest
-            package-command: package-linux
+            package-command: npm run package-linux
+            package-shell: bash
+            attestation-subject-path: |
+              target/*.AppImage
+              target/*.deb
+              target/*.tar.gz
+          - name: Linux ARM
+            platform: linux
+            arch: arm64
+            # Built on an ARM runner: Node 14 has Linux ARM binaries, and the
+            # native modules then compile for the machine they run on.
+            os: ubuntu-24.04-arm
+            package-command: >-
+              npx electron-builder -p never -l appimage deb tar.gz --arm64
+              -c.artifactName='Cattr-arm64.${ext}'
+            package-shell: bash
             attestation-subject-path: |
               target/*.AppImage
               target/*.deb
               target/*.tar.gz
           - name: Windows
+            platform: windows
+            arch: x64
             # Node 14's bundled node-gyp cannot detect newer Visual Studio.
             # windows-2022 provides VS 2022 for the project node-gyp below.
             os: windows-2022
-            package-command: package-windows
+            package-command: npm run package-windows
+            package-shell: pwsh
+            attestation-subject-path: target/*.exe
+          - name: Windows ARM
+            platform: windows
+            arch: arm64
+            # Cross-built on the x64 image: Node 14 has no Windows ARM build.
+            # electron-builder rebuilds the native modules for ARM while
+            # packaging, using the ARM64 toolset of the same Visual Studio.
+            os: windows-2022
+            package-command: >-
+              npx electron-builder -p never -w portable nsis --arm64
+              -c.artifactName='Cattr-arm64.${ext}'
+              -c.nsis.artifactName='Cattr_Setup-arm64.${ext}'
+            # PowerShell splits an argument such as -c.artifactName at the dot.
+            package-shell: bash
             attestation-subject-path: target/*.exe
           - name: macOS
+            platform: mac
+            arch: x64
             # macos-13 is no longer available as a standard hosted image.
             # Use the current Intel image so the release remains compatible
             # with existing x64 macOS installations.
             os: macos-15-intel
-            package-command: package-mac
+            package-command: npm run package-mac
+            package-shell: bash
+            attestation-subject-path: target/*.dmg
+          - name: macOS ARM
+            platform: mac
+            arch: arm64
+            # Cross-built on the Intel image: Node 14 has no Apple Silicon
+            # build, and Apple's compiler targets both architectures.
+            os: macos-15-intel
+            package-command: >-
+              npx electron-builder -p never -m --arm64
+              -c.artifactName='Cattr-arm64.${ext}'
+            package-shell: bash
             attestation-subject-path: target/*.dmg
 
     steps:
       - name: Check out the release tag
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.ref }}
+          # The release tag, or the commit itself on a build-only run.
+          ref: ${{ needs.prepare.outputs.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -89,16 +246,30 @@ jobs:
           # file mode and therefore is incompatible with Python 3.11+.
           python-version: '3.10'
 
+      - name: Set up fpm for the .deb package
+        if: matrix.platform == 'linux' && matrix.arch == 'arm64'
+        # electron-builder downloads an x64 build of fpm, which cannot run on
+        # an ARM runner. USE_SYSTEM_FPM makes it use the one installed here.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ruby ruby-dev build-essential
+          sudo gem install fpm --no-document
+          echo 'USE_SYSTEM_FPM=true' >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: npm ci
 
-      - run: npm --no-git-tag-version version ${{ github.ref_name }}
+      - name: Set the application version
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: npm --no-git-tag-version version "$RELEASE_TAG"
 
       - name: Build application
         run: npm run build-release
 
       - name: Prepare macOS signing and notarization credentials
-        if: matrix.name == 'macOS'
+        if: matrix.platform == 'mac'
         id: macos-credentials
         shell: bash
         env:
@@ -145,26 +316,60 @@ jobs:
           echo "macOS signing: $signing"
           echo "macOS notarization: $notarization"
 
+      # `shell` cannot read the matrix, hence one step per shell.
       - name: Package application
-        if: matrix.name != 'macOS'
-        run: npm run ${{ matrix.package-command }}
+        if: matrix.platform != 'mac' && matrix.package-shell == 'bash'
+        shell: bash
+        run: ${{ matrix.package-command }}
+
+      - name: Package application (PowerShell)
+        if: matrix.platform != 'mac' && matrix.package-shell == 'pwsh'
+        shell: pwsh
+        run: ${{ matrix.package-command }}
 
       - name: Package unsigned macOS application
-        if: matrix.name == 'macOS' && steps.macos-credentials.outputs.signing == 'no'
-        run: npm run package-mac
+        if: matrix.platform == 'mac' && matrix.arch == 'x64' && steps.macos-credentials.outputs.signing == 'no'
+        run: ${{ matrix.package-command }}
+
+      # Apple Silicon refuses to start an application without a valid
+      # signature, and packaging invalidates the one Electron ships with. With
+      # no certificate configured, the application is therefore packaged into
+      # a directory first, signed ad hoc (no Apple account involved), and only
+      # then wrapped into the .dmg. Users still have to allow it on first
+      # launch, as with the unsigned x64 build.
+      - name: Package ad hoc signed macOS ARM application
+        if: matrix.platform == 'mac' && matrix.arch == 'arm64' && steps.macos-credentials.outputs.signing == 'no'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npx electron-builder -p never -m dir --arm64
+
+          app_path="$(find target -type d -name 'Cattr.app' -print -quit)"
+          if [[ -z "$app_path" ]]; then
+            echo 'Packaged Cattr.app was not found.' >&2
+            exit 1
+          fi
+
+          codesign --force --deep --sign - "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+
+          npx electron-builder -p never -m dmg --arm64 \
+            --prepackaged "$app_path" \
+            -c.artifactName='Cattr-arm64.${ext}'
 
       - name: Package signed macOS application
-        if: matrix.name == 'macOS' && steps.macos-credentials.outputs.signing == 'yes'
+        if: matrix.platform == 'mac' && steps.macos-credentials.outputs.signing == 'yes'
         env:
           CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
           APPLE_API_KEY: ${{ steps.macos-credentials.outputs.apple-api-key }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: npm run package-mac
+        run: ${{ matrix.package-command }}
 
       - name: Verify macOS application signature
-        if: matrix.name == 'macOS' && steps.macos-credentials.outputs.signing == 'yes'
+        if: matrix.platform == 'mac' && steps.macos-credentials.outputs.signing == 'yes'
         shell: bash
         run: |
           app_path="$(find target -type d -name 'Cattr.app' -print -quit)"
@@ -181,7 +386,7 @@ jobs:
           fi
 
       - name: Validate macOS notarization ticket
-        if: matrix.name == 'macOS' && steps.macos-credentials.outputs.notarization == 'yes'
+        if: matrix.platform == 'mac' && steps.macos-credentials.outputs.notarization == 'yes'
         shell: bash
         run: |
           app_path="$(find target -type d -name 'Cattr.app' -print -quit)"
@@ -193,14 +398,25 @@ jobs:
           spctl --assess --type execute --verbose=2 "$app_path"
 
       - name: Attest build provenance
+        if: needs.prepare.outputs.publish == 'true'
         uses: actions/attest@v4
         with:
           subject-path: ${{ matrix.attestation-subject-path }}
 
+      - name: Attach packages to the workflow run
+        if: needs.prepare.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ matrix.attestation-subject-path }}
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload release assets to draft
+        if: needs.prepare.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         shell: bash
         run: |
           shopt -s nullglob
@@ -223,12 +439,20 @@ jobs:
 
   publish-release:
     name: Publish release
-    needs: build-and-attest
+    needs:
+      - prepare
+      - build-and-attest
+    # build-and-attest has a custom condition, so its result has to be checked
+    # here explicitly: a failed build must leave the release as a draft.
+    if: >-
+      !cancelled()
+      && needs.build-and-attest.result == 'success'
+      && needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
 
     steps:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false

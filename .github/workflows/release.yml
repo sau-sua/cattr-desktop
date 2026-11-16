@@ -148,79 +148,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The x64 entries package exactly as before and keep their file names
-        # (Cattr.dmg, Cattr.exe, ...), so existing download links stay valid.
-        # The ARM entries add "-arm64" to every file name; they pass the name
-        # on the command line instead of changing electron-builder.json so the
-        # x64 packages are not affected.
         include:
           - name: Linux
-            platform: linux
-            arch: x64
             os: ubuntu-latest
-            package-command: npm run package-linux
-            package-shell: bash
-            attestation-subject-path: |
-              target/*.AppImage
-              target/*.deb
-              target/*.tar.gz
-          - name: Linux ARM
-            platform: linux
-            arch: arm64
-            # Built on an ARM runner: Node 14 has Linux ARM binaries, and the
-            # native modules then compile for the machine they run on.
-            os: ubuntu-24.04-arm
-            package-command: >-
-              npx electron-builder -p never -l appimage deb tar.gz --arm64
-              -c.artifactName='Cattr-arm64.${ext}'
-            package-shell: bash
+            package-command: package-linux
             attestation-subject-path: |
               target/*.AppImage
               target/*.deb
               target/*.tar.gz
           - name: Windows
-            platform: windows
-            arch: x64
             # Node 14's bundled node-gyp cannot detect newer Visual Studio.
             # windows-2022 provides VS 2022 for the project node-gyp below.
             os: windows-2022
-            package-command: npm run package-windows
-            package-shell: pwsh
-            attestation-subject-path: target/*.exe
-          - name: Windows ARM
-            platform: windows
-            arch: arm64
-            # Cross-built on the x64 image: Node 14 has no Windows ARM build.
-            # electron-builder rebuilds the native modules for ARM while
-            # packaging, using the ARM64 toolset of the same Visual Studio.
-            os: windows-2022
-            package-command: >-
-              npx electron-builder -p never -w portable nsis --arm64
-              -c.artifactName='Cattr-arm64.${ext}'
-              -c.nsis.artifactName='Cattr_Setup-arm64.${ext}'
-            # PowerShell splits an argument such as -c.artifactName at the dot.
-            package-shell: bash
+            package-command: package-windows
             attestation-subject-path: target/*.exe
           - name: macOS
-            platform: mac
-            arch: x64
             # macos-13 is no longer available as a standard hosted image.
             # Use the current Intel image so the release remains compatible
             # with existing x64 macOS installations.
             os: macos-15-intel
-            package-command: npm run package-mac
-            package-shell: bash
-            attestation-subject-path: target/*.dmg
-          - name: macOS ARM
-            platform: mac
-            arch: arm64
-            # Cross-built on the Intel image: Node 14 has no Apple Silicon
-            # build, and Apple's compiler targets both architectures.
-            os: macos-15-intel
-            package-command: >-
-              npx electron-builder -p never -m --arm64
-              -c.artifactName='Cattr-arm64.${ext}'
-            package-shell: bash
+            package-command: package-mac
             attestation-subject-path: target/*.dmg
 
     steps:
@@ -246,16 +193,6 @@ jobs:
           # file mode and therefore is incompatible with Python 3.11+.
           python-version: '3.10'
 
-      - name: Set up fpm for the .deb package
-        if: matrix.platform == 'linux' && matrix.arch == 'arm64'
-        # electron-builder downloads an x64 build of fpm, which cannot run on
-        # an ARM runner. USE_SYSTEM_FPM makes it use the one installed here.
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends ruby ruby-dev build-essential
-          sudo gem install fpm --no-document
-          echo 'USE_SYSTEM_FPM=true' >> "$GITHUB_ENV"
-
       - name: Install dependencies
         run: npm ci
 
@@ -269,7 +206,7 @@ jobs:
         run: npm run build-release
 
       - name: Prepare macOS signing and notarization credentials
-        if: matrix.platform == 'mac'
+        if: matrix.name == 'macOS'
         id: macos-credentials
         shell: bash
         env:
@@ -316,60 +253,26 @@ jobs:
           echo "macOS signing: $signing"
           echo "macOS notarization: $notarization"
 
-      # `shell` cannot read the matrix, hence one step per shell.
       - name: Package application
-        if: matrix.platform != 'mac' && matrix.package-shell == 'bash'
-        shell: bash
-        run: ${{ matrix.package-command }}
-
-      - name: Package application (PowerShell)
-        if: matrix.platform != 'mac' && matrix.package-shell == 'pwsh'
-        shell: pwsh
-        run: ${{ matrix.package-command }}
+        if: matrix.name != 'macOS'
+        run: npm run ${{ matrix.package-command }}
 
       - name: Package unsigned macOS application
-        if: matrix.platform == 'mac' && matrix.arch == 'x64' && steps.macos-credentials.outputs.signing == 'no'
-        run: ${{ matrix.package-command }}
-
-      # Apple Silicon refuses to start an application without a valid
-      # signature, and packaging invalidates the one Electron ships with. With
-      # no certificate configured, the application is therefore packaged into
-      # a directory first, signed ad hoc (no Apple account involved), and only
-      # then wrapped into the .dmg. Users still have to allow it on first
-      # launch, as with the unsigned x64 build.
-      - name: Package ad hoc signed macOS ARM application
-        if: matrix.platform == 'mac' && matrix.arch == 'arm64' && steps.macos-credentials.outputs.signing == 'no'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          npx electron-builder -p never -m dir --arm64
-
-          app_path="$(find target -type d -name 'Cattr.app' -print -quit)"
-          if [[ -z "$app_path" ]]; then
-            echo 'Packaged Cattr.app was not found.' >&2
-            exit 1
-          fi
-
-          codesign --force --deep --sign - "$app_path"
-          codesign --verify --deep --strict --verbose=2 "$app_path"
-
-          npx electron-builder -p never -m dmg --arm64 \
-            --prepackaged "$app_path" \
-            -c.artifactName='Cattr-arm64.${ext}'
+        if: matrix.name == 'macOS' && steps.macos-credentials.outputs.signing == 'no'
+        run: npm run package-mac
 
       - name: Package signed macOS application
-        if: matrix.platform == 'mac' && steps.macos-credentials.outputs.signing == 'yes'
+        if: matrix.name == 'macOS' && steps.macos-credentials.outputs.signing == 'yes'
         env:
           CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}
           APPLE_API_KEY: ${{ steps.macos-credentials.outputs.apple-api-key }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: ${{ matrix.package-command }}
+        run: npm run package-mac
 
       - name: Verify macOS application signature
-        if: matrix.platform == 'mac' && steps.macos-credentials.outputs.signing == 'yes'
+        if: matrix.name == 'macOS' && steps.macos-credentials.outputs.signing == 'yes'
         shell: bash
         run: |
           app_path="$(find target -type d -name 'Cattr.app' -print -quit)"
@@ -386,7 +289,7 @@ jobs:
           fi
 
       - name: Validate macOS notarization ticket
-        if: matrix.platform == 'mac' && steps.macos-credentials.outputs.notarization == 'yes'
+        if: matrix.name == 'macOS' && steps.macos-credentials.outputs.notarization == 'yes'
         shell: bash
         run: |
           app_path="$(find target -type d -name 'Cattr.app' -print -quit)"
@@ -407,7 +310,7 @@ jobs:
         if: needs.prepare.outputs.publish != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform }}-${{ matrix.arch }}
+          name: ${{ matrix.name }}
           path: ${{ matrix.attestation-subject-path }}
           if-no-files-found: error
           retention-days: 7
